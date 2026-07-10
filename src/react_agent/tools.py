@@ -1,7 +1,7 @@
+import os
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import AsyncExitStack
 from typing import Any, Callable, Dict, List, Optional, cast
@@ -10,16 +10,13 @@ from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
 from langgraph.runtime import get_runtime
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
 from react_agent.context import Context
 
+
 logger = logging.getLogger(__name__)
-
-
-def _log_server_message(params: Any) -> None:
-    logger.warning("MCP server log: %s", params)
 
 
 @tool
@@ -60,86 +57,43 @@ def pick_best_webcam(webcams: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 class WindyMCPClient:
-    def __init__(
+    def __init__(self, server_url: str = "http://localhost:6277/mcp") -> None:
+        self.server_url = server_url.rstrip("/")
+        #self.session_token = "b8875922da1d0148ecb962c5c0ba477b0d0a1005a1ed64f473dc2a91ac1e4157"
+
+    async def _call_tool_once(
         self,
-        server_script_path: str,
-        command: str = "node",
-        env: Optional[Dict[str, str]] = None,
-    ) -> None:
-        self.server_script_path = server_script_path
-        self.command = command
-        self.env = env or os.environ.copy()
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout_seconds: int = 30,
+    ) -> Any:
+        logger.info("Connecting MCP over HTTP to %s", self.server_url)
+        started = time.perf_counter()
 
-        self._exit_stack: Optional[AsyncExitStack] = None
-        self._session: Optional[ClientSession] = None
-        self._lock = asyncio.Lock()
-        self._connected = False
-
-    async def connect(self) -> None:
-        async with self._lock:
-            if self._connected and self._session is not None:
-                return
-
-            logger.info("Connecting Windy MCP client...")
-
-            stack = AsyncExitStack()
-            try:
-                server = StdioServerParameters(
-                    command=self.command,
-                    args=[self.server_script_path],
-                    env=self.env,
+        async with AsyncExitStack() as stack:
+            read_stream, write_stream, _ = await stack.enter_async_context(
+                streamablehttp_client(
+                    self.server_url,
+                    # headers={
+                    #     "Authorization": f"Bearer {self.session_token}"
+                    # },
                 )
+            )
 
-                read_stream, write_stream = await stack.enter_async_context(
-                    stdio_client(server)
-                )
+            session = await stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
 
-                session = await stack.enter_async_context(
-                    ClientSession(
-                        read_stream,
-                        write_stream,
-                        logging_callback=_log_server_message,
-                    )
-                )
+            await asyncio.wait_for(session.initialize(), timeout=20)
 
-                await asyncio.wait_for(session.initialize(), timeout=20)
-                await asyncio.wait_for(session.send_ping(), timeout=10)
+            result = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments),
+                timeout=timeout_seconds,
+            )
 
-                tools_response = await asyncio.wait_for(session.list_tools(), timeout=10)
-                tool_names = [tool.name for tool in tools_response.tools]
-                logger.info("Available MCP tools: %s", tool_names)
-
-                required = {"get_webcams_by_location", "get_webcam"}
-                missing = required.difference(tool_names)
-                if missing:
-                    raise RuntimeError(
-                        f"Missing MCP tools: {sorted(missing)}. Available tools={tool_names}"
-                    )
-
-                self._exit_stack = stack
-                self._session = session
-                self._connected = True
-                logger.info("Windy MCP client connected")
-            except Exception:
-                await stack.aclose()
-                raise
-
-    async def close(self) -> None:
-        async with self._lock:
-            if self._exit_stack is not None:
-                logger.info("Closing Windy MCP client...")
-                await self._exit_stack.aclose()
-
-            self._exit_stack = None
-            self._session = None
-            self._connected = False
-
-    async def _ensure_connected(self) -> ClientSession:
-        if not self._connected or self._session is None:
-            await self.connect()
-
-        assert self._session is not None
-        return self._session
+            elapsed = time.perf_counter() - started
+            logger.info("Tool=%s completed in %.2fs", tool_name, elapsed)
+            return result
 
     async def call_tool_with_timeout(
         self,
@@ -147,21 +101,13 @@ class WindyMCPClient:
         arguments: Dict[str, Any],
         timeout_seconds: int = 30,
     ) -> Any:
-        session = await self._ensure_connected()
-        logger.info("Calling tool=%s args=%s", tool_name, arguments)
-        started = time.perf_counter()
-
         try:
-            result = await asyncio.wait_for(
-                session.call_tool(tool_name, arguments),
-                timeout=timeout_seconds,
-            )
-            elapsed = time.perf_counter() - started
-            logger.info("Tool=%s completed in %.2fs", tool_name, elapsed)
-            return result
+            return await self._call_tool_once(tool_name, arguments, timeout_seconds)
+        except asyncio.CancelledError:
+            logger.exception("Tool=%s was cancelled by the runtime", tool_name)
+            raise RuntimeError(f"MCP tool '{tool_name}' was cancelled") from None
         except asyncio.TimeoutError as e:
-            elapsed = time.perf_counter() - started
-            logger.exception("Tool=%s timed out after %.2fs", tool_name, elapsed)
+            logger.exception("Tool=%s timed out after %ss", tool_name, timeout_seconds)
             raise RuntimeError(
                 f"MCP tool '{tool_name}' timed out after {timeout_seconds}s"
             ) from e
@@ -171,11 +117,6 @@ class WindyMCPClient:
         country_code: str,
         limit: int = 10,
     ) -> Dict[str, Any]:
-        logger.info("Starting get_country_live_feed country=%s limit=%s",
-            country_code,
-            limit,
-        )
-
         result = await self.call_tool_with_timeout(
             "get_webcams_by_location",
             {
@@ -187,14 +128,14 @@ class WindyMCPClient:
             timeout_seconds=45,
         )
 
-        if not result.content:
+        content = getattr(result, "content", None)
+        if not content:
             raise RuntimeError("get_webcams_by_location returned no content")
-        
-        logger.info("get_webcams_by_location returned result: %s", result)
 
-        payload = getattr(result.content, "text", None)
+        first_item = content[0] if isinstance(content, list) and content else None
+        payload = getattr(first_item, "text", None) if first_item else None
         if not payload:
-            raise RuntimeError(f"Expected text content, got: {result.content!r}")
+            raise RuntimeError(f"Expected text content, got: {content!r}")
 
         try:
             data = json.loads(payload)
@@ -225,12 +166,16 @@ class WindyMCPClient:
             timeout_seconds=45,
         )
 
-        if not details.content:
+        detail_content = getattr(details, "content", None)
+        if not detail_content:
             raise RuntimeError("get_webcam returned no content")
 
-        detail_payload = getattr(details.content, "text", None)
+        first_detail_item = (
+            detail_content[0] if isinstance(detail_content, list) and detail_content else None
+        )
+        detail_payload = getattr(first_detail_item, "text", None) if first_detail_item else None
         if not detail_payload:
-            raise RuntimeError(f"Expected text detail content, got: {details.content!r}")
+            raise RuntimeError(f"Expected text detail content, got: {detail_content!r}")
 
         try:
             detail_data = json.loads(detail_payload)
@@ -261,11 +206,7 @@ class WindyMCPClient:
         }
 
 
-WINDY_MCP_CLIENT = WindyMCPClient(
-    server_script_path=r"C:\Users\esteb\Videos\LangGraph\windy-webcams-mcp-server\build\index.js",
-    command="node",
-    env=os.environ.copy(),
-)
+WINDY_MCP_CLIENT = WindyMCPClient(server_url="http://localhost:6277/mcp")
 
 
 @tool
